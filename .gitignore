@@ -1,0 +1,5 @@
+# pi agent config
+auth.json
+bin/
+sessions/
+pi-acp/
