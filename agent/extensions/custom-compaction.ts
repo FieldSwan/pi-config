@@ -16,7 +16,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { complete } from "@earendil-works/pi-ai";
+import { uuidv7 } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 
@@ -24,9 +25,9 @@ function getCompactionModel(): string {
 	try {
 		const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
 		const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-		return settings?.compaction?.model ?? "gemini-2.5-pro";
+		return settings?.compaction?.model ?? "gemini-3-flash-preview";
 	} catch {
-		return "gemini-2.5-pro";
+		return "gemini-3-flash-preview";
 	}
 }
 
@@ -40,7 +41,7 @@ export default function (pi: ExtensionAPI) {
 		// Resolve compaction model from settings.json (compaction.model), using the default provider
 		const compactionModelId = getCompactionModel();
 		const defaultProvider = ctx.model?.provider ?? "github-copilot";
-		const model = ctx.modelRegistry.find(defaultProvider, compactionModelId);
+		let model = ctx.modelRegistry.find(defaultProvider, compactionModelId);
 		if (!model) {
 			ctx.ui.notify(`Could not find model ${defaultProvider}/${compactionModelId}, using default compaction`, "warning");
 			return;
@@ -55,6 +56,12 @@ export default function (pi: ExtensionAPI) {
 		if (!auth.apiKey) {
 			ctx.ui.notify(`No API key for ${model.provider}, using default compaction`, "warning");
 			return;
+		}
+
+		// Apply OAuth-derived baseUrl (e.g. GitHub Copilot rewrites baseUrl from token proxy-ep)
+		const providerAuth = await ctx.modelRegistry.getProviderAuth(model.provider);
+		if (providerAuth?.auth.baseUrl) {
+			model = { ...model, baseUrl: providerAuth.auth.baseUrl };
 		}
 
 		// Combine all messages for full summary
@@ -108,8 +115,11 @@ ${conversationText}
 				{
 					apiKey: auth.apiKey,
 					headers: auth.headers,
+					env: auth.env,
 					maxTokens: 8192,
 					signal,
+					cacheRetention: "none",
+					sessionId: uuidv7(),
 				},
 			);
 
@@ -130,6 +140,7 @@ ${conversationText}
 					summary,
 					firstKeptEntryId,
 					tokensBefore,
+					usage: response.usage,
 				},
 			};
 		} catch (error) {
