@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.74.0",
+  "lastChangelogVersion": "0.82.1",
   "defaultProvider": "github-copilot",
   "defaultModel": "claude-opus-4.6",
   "defaultThinkingLevel": "medium",
@@ -7,5 +7,9 @@
   "compaction": {
     "enabled": false,
     "model": "gemini-3-flash-preview"
-  }
+  },
+  "theme": "dark",
+  "packages": [
+    "git:github.com/DietrichGebert/ponytail"
+  ]
 }

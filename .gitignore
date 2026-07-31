@@ -3,3 +3,5 @@ auth.json
 bin/
 sessions/
 pi-acp/
+agent/trust.json
+agent/models-store.json

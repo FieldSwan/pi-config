@@ -1,0 +1,4 @@
+[submodule "agent/git/github.com/DietrichGebert/ponytail"]
+	path = agent/git/github.com/DietrichGebert/ponytail
+	url = https://github.com/DietrichGebert/ponytail
+        branch = release-4.8.4
