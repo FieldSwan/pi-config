@@ -10,6 +10,6 @@
   },
   "theme": "dark",
   "packages": [
-    "git:github.com/DietrichGebert/ponytail"
+    "git:github.com/DietrichGebert/ponytail@swan/4.9.0-no-ponytail-comment"
   ]
 }
