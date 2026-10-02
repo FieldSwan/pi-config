@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // `claude plugin eval` for Pi: same case layout, grader files, flags, scoring, report and exit codes.
 // Unsupported features fail loudly, not silently.
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -9,7 +9,7 @@ import path from "node:path";
 
 import { parse as parseYaml } from "yaml";
 
-import { lastMessage, toClaudeTranscript } from "./claude-compat.mjs";
+import { toClaudeTranscript } from "./claude-compat.mjs";
 import { grade, GRADER_TYPES } from "./graders.mjs";
 import { renderHtml } from "./report.mjs";
 
@@ -64,7 +64,7 @@ async function loadCase(dir)
     {
         const { meta: g, body: graderBody } = splitFrontmatter(await readFile(path.join(graderDir, file), "utf8"), file);
         if (!GRADER_TYPES.has(g.type)) throw new Error(`${dir}/graders/${file}: unknown grader type ${g.type}`);
-        return { name: file.replace(/\.md$/u, ""), weight: 1, ...g, criteria: g.criteria ?? graderBody };
+        return { name: file.replace(/\.md$/u, ""), weight: 1, ...g, criteria: g.criteria ?? graderBody, markdown: graderBody };
     }));
     if (graders.length === 0) throw new Error(`${dir}: a case needs at least one grader`);
     return { id: meta.name ?? path.basename(dir), dir, prompt: body, graders, tags: meta.tags ?? [], ...meta };
@@ -72,7 +72,7 @@ async function loadCase(dir)
 
 /**
  * One isolated, non-interactive Pi session: no user extensions, skills, context files or prompt templates,
- * only what the arm loads. Resolves with the final messages and cost, or rejects on timeout or turn cap.
+ * only what the arm loads. Resolves with the final messages, cost and turns, or rejects on timeout or turn cap.
  */
 function runPi({ cwd, prompt, model, tools, skills, appendSystemPrompt, timeoutMs, maxTurns, eventsFile })
 {
@@ -91,6 +91,7 @@ function runPi({ cwd, prompt, model, tools, skills, appendSystemPrompt, timeoutM
         let stderr = "";
         let turns = 0;
         let cost = 0;
+        const messages = [];
         let failure = null;
         const stop = (message) => { failure ??= message; child.kill("SIGTERM"); };
         const timer = setTimeout(() => stop(`timed out after ${timeoutMs / 1000}s`), timeoutMs);
@@ -105,6 +106,7 @@ function runPi({ cwd, prompt, model, tools, skills, appendSystemPrompt, timeoutM
                 lines.push(line);
                 const event = JSON.parse(line);
                 // Summed as the run goes, so a killed run still counts toward --max-cost-usd.
+                if (event.type === "message_end") messages.push(event.message);
                 if (event.type === "message_end" && event.message?.role === "assistant") cost += event.message.usage?.cost?.total ?? 0;
                 if (event.type === "turn_start" && ++turns > maxTurns) stop(`hit max_turns ${maxTurns}`);
             }
@@ -115,33 +117,37 @@ function runPi({ cwd, prompt, model, tools, skills, appendSystemPrompt, timeoutM
             clearTimeout(timer);
             await writeFile(eventsFile, `${lines.join("\n")}\n`);
             const end = lines.map((l) => JSON.parse(l)).findLast((e) => e.type === "agent_end");
-            if (failure === null && end !== undefined) resolve({ messages: end.messages, cost });
-            else reject(Object.assign(new Error(failure ?? `pi exited ${code} without finishing: ${stderr.trim().split("\n").at(-1) ?? ""}`), { cost }));
+            if (failure === null && end !== undefined) resolve({ messages: end.messages, cost, turns });
+            // A killed run is still graded on what it produced, as in Claude.
+            else reject(Object.assign(new Error(failure ?? `pi exited ${code} without finishing: ${stderr.trim().split("\n").at(-1) ?? ""}`), { cost, turns, messages }));
         });
     });
 }
 
-// Graders that can only pass with the plugin would inflate Δ, so two-arm runs report but do not score them.
+// Graders that can only pass with the plugin; in a two-arm run they are reported, not scored, so Δ stays honest.
+const isWithOnly = (g) => g.arm !== "both" && (g.arm === "with-only" || (g.type === "tool_used" && g.tool === "Skill"));
+
 function scoredGraders(graders, twoArm)
 {
     if (!twoArm) return graders.map(() => true);
-    const scored = graders.map((g) => g.arm === "both" || (g.arm !== "with-only" && !(g.type === "tool_used" && g.tool === "Skill")));
+    const scored = graders.map((g) => !isWithOnly(g));
     return scored.some(Boolean) ? scored : graders.map(() => true);
 }
 
-// A run that errored scores 0, as in Claude.
+/** One run, shaped like an entry of Claude's `cases[].arms.<arm>[]`; `eventsPath` is Pi-only. */
 async function runOnce(evalCase, arm, attempt, ctx)
 {
     const directory = path.join(ctx.outputDir, evalCase.id, `run-${attempt}`, arm.id);
     const cwd = path.join(ctx.workspacesDir, evalCase.id, `run-${attempt}`, arm.id);
     await mkdir(directory, { recursive: true });
     await mkdir(cwd, { recursive: true });
-    const base = { arm: arm.id, attempt, directory, graders: [], reply: "", costUsd: 0 };
-    let messages;
-    let cost;
+    const started = Date.now();
+    const eventsPath = path.join(directory, "events.jsonl");
+    let result;
+    let error = null;
     try
     {
-        ({ messages, cost } = await runPi({
+        result = await runPi({
             cwd,
             prompt: evalCase.prompt,
             model: ctx.model ?? evalCase.model,
@@ -150,29 +156,69 @@ async function runOnce(evalCase, arm, attempt, ctx)
             appendSystemPrompt: evalCase.append_system_prompt,
             timeoutMs: (evalCase.timeout_seconds ?? 300) * 1000,
             maxTurns: evalCase.max_turns ?? 10,
-            eventsFile: path.join(directory, "events.jsonl"),
+            eventsFile: eventsPath,
+        });
+    }
+    catch (caught)
+    {
+        error = caught.message;
+        result = { messages: caught.messages ?? [], cost: caught.cost ?? 0, turns: caught.turns ?? 0 };
+    }
+    const scored = scoredGraders(evalCase.graders, ctx.twoArm);
+    // The baseline leaves out graders it does not score, as Claude's does.
+    const graderDefs = evalCase.graders.map((g, i) => ({ g, scored: scored[i] })).filter(({ scored: s }) => arm.id === "with" || s);
+    let graders = [];
+    let tracePath = null;
+    if (result.messages.length > 0)
+    {
+        const transcript = toClaudeTranscript(result.messages, { ...ctx.compat, cwd });
+        tracePath = path.join(directory, "transcript.jsonl");
+        await writeFile(tracePath, `${transcript.map((l) => JSON.stringify(l)).join("\n")}\n`);
+        const run = { transcript, cwd, caseDir: evalCase.dir };
+        graders = await Promise.all(graderDefs.map(async ({ g, scored: s }) =>
+        {
+            const { passed, explanation, judgeVotes, evidence, judgeOutputs, judgeCostUsd } = await grade(g, run, ctx.judgeModel ?? evalCase.model);
+            return { name: g.name, passed, weight: g.weight, explanation, withOnly: isWithOnly(g), scored: s, ...(judgeVotes === undefined ? {} : { judgeVotes }),
+                evidence: evidence ?? null, ...(judgeOutputs === undefined ? {} : { judgeOutputs, judgeCostUsd }) };
         }));
     }
-    catch (error)
-    {
-        process.stdout.write(`  ${evalCase.id} [${arm.id}] run ${attempt} error: ${error.message}\n`);
-        return { ...base, score: 0, error: error.message, costUsd: error.cost ?? 0 };
-    }
-    const transcript = toClaudeTranscript(messages, { ...ctx.compat, cwd });
-    await writeFile(path.join(directory, "transcript.jsonl"), `${transcript.map((l) => JSON.stringify(l)).join("\n")}\n`);
-    const scored = scoredGraders(evalCase.graders, ctx.twoArm);
-    const run = { transcript, cwd, caseDir: evalCase.dir };
-    const graders = await Promise.all(evalCase.graders.map(async (g, i) =>
-        ({ name: g.name, type: g.type, weight: g.weight, scored: scored[i], ...await grade(g, run, ctx.judgeModel ?? evalCase.model) })));
     const counted = graders.filter((r) => r.scored);
-    const score = counted.reduce((s, r) => s + (r.passed ? r.weight : 0), 0) / counted.reduce((s, r) => s + r.weight, 0);
+    const total = counted.reduce((s, r) => s + r.weight, 0);
+    const score = total === 0 ? 0 : counted.reduce((s, r) => s + (r.passed ? r.weight : 0), 0) / total;
     if (!ctx.keepTemp) await rm(cwd, { recursive: true, force: true });
-    process.stdout.write(`  ${evalCase.id} [${arm.id}] run ${attempt} score ${score.toFixed(2)}  ${graders.map((r) => `${r.passed ? "✓" : "✗"} ${r.name}${r.scored ? "" : " (unscored)"}`).join("  ")}\n`);
-    return { ...base, score, graders, reply: lastMessage(transcript), costUsd: cost };
+    const verdicts = graders.map((r) => `${r.passed ? "✓" : "✗"} ${r.name}${r.scored ? "" : " (unscored)"}`).join("  ");
+    process.stdout.write(`  ${evalCase.id} [${arm.id}] run ${attempt} score ${score.toFixed(2)}  ${error === null ? verdicts : `error: ${error}`}\n`);
+    return {
+        score,
+        passed: error === null && counted.every((r) => r.passed),
+        turns: result.turns,
+        costUsd: result.cost,
+        judgeCostUsd: graders.reduce((s, r) => s + (r.judgeCostUsd ?? 0), 0),
+        durationSeconds: Math.round((Date.now() - started) / 1000),
+        startedAt: new Date(started).toISOString(),
+        error,
+        tracePath,
+        skippedPaidGraders: false,
+        graders: graders.map(({ judgeCostUsd, ...r }) => r),
+        eventsPath,
+    };
+}
+
+// Claude's `cases[].graders[]`: options under `config`, with defaults filled in, and the body as `graderMarkdown`.
+function graderDefinition(g)
+{
+    const { name, type, weight, arm, markdown, criteria, ...options } = g;
+    const judged = type === "llm" || type === "baseline";
+    // Same key order as Claude: defaults filled in around the options the file set.
+    const config = type === "regex" ? { target: "last_message", ...options, match: options.match ?? "contains" }
+        : type === "llm" ? { criteria, focus: "last_message", ...options }
+        : judged ? { criteria, ...options } : options;
+    return { name, type, weight, ...(arm === undefined ? {} : { arm }), ...(judged && markdown ? { graderMarkdown: markdown } : {}), config };
 }
 
 const mean = (xs) => xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
 const fmt = (x, sign = false) => x === null ? "-" : `${sign && x >= 0 ? "+" : ""}${x.toFixed(2)}`;
+const runCost = (r) => r.costUsd + r.judgeCostUsd;
 
 async function main()
 {
@@ -185,11 +231,12 @@ async function main()
     if (!["none", "with-without"].includes(ablation)) throw new Error("--ablation must be none or with-without");
     const twoArm = ablation === "with-without";
     const threshold = Number(flags.threshold ?? 1);
+    const startedAt = new Date();
     const costCap = flags["max-cost-usd"] === undefined ? Infinity : Number(flags["max-cost-usd"]);
     // Read by sandbox.mjs inside each Pi child, which inherits this environment.
     process.env.PI_EVAL_SKILLS_DIR = skillsDir;
     const ctx = {
-        outputDir: path.resolve(flags["output-dir"] ?? path.join(evalDir, "results", `${new Date().toISOString().replaceAll(/[:.]/gu, "-")}-pi`)),
+        outputDir: path.resolve(flags["output-dir"] ?? path.join(evalDir, "results", `${startedAt.toISOString().replaceAll(/[:.]/gu, "-")}-pi`)),
         // Outside the repo, so Pi cannot discover the monorepo's AGENTS.md or skills from the workspace.
         workspacesDir: await mkdtemp(path.join(os.tmpdir(), "pi-plugin-eval-")),
         model: flags.model,
@@ -204,7 +251,7 @@ async function main()
         .filter((c) => flags.case === undefined || path.matchesGlob(c.id, flags.case));
     if (cases.length === 0) { process.stderr.write("No cases found\n"); process.exitCode = 1; return; }
 
-    const rows = [];
+    const results = [];
     let spent = 0;
     let partial = null;
     for (const evalCase of cases)
@@ -214,55 +261,98 @@ async function main()
         // Bash is unconfined; wrap it in bwrap like Claude's sandbox where user namespaces are allowed.
         if (tools.includes("bash")) process.stderr.write(`  warning: ${evalCase.id} grants Bash, which Pi runs without a sandbox\n`);
         const arms = [{ id: "with", skills: [skillsDir], tools }, ...(twoArm ? [{ id: "without", skills: [], tools }] : [])];
-        const runs = [];
-        for (let attempt = 1; attempt <= Number(flags.runs ?? evalCase.runs ?? 3); attempt += 1)
+        const runs = { with: [], ...(twoArm ? { without: [] } : {}) };
+        const runsPerCase = Number(flags.runs ?? evalCase.runs ?? 3);
+        for (let attempt = 1; attempt <= runsPerCase && partial === null; attempt += 1)
         {
             for (const arm of arms)
             {
                 // Checked before each run starts, as Claude does; a started run may overshoot the cap.
                 if (spent >= costCap) { partial = `--max-cost-usd ${costCap} reached`; break; }
                 const run = await runOnce(evalCase, arm, attempt, ctx);
-                spent += run.costUsd;
-                runs.push(run);
+                spent += runCost(run);
+                runs[arm.id].push(run);
             }
-            if (partial !== null) break;
         }
-        const arm = (id) => runs.filter((r) => r.arm === id);
-        const withScore = mean(arm("with").map((r) => r.score));
-        const withoutScore = twoArm ? mean(arm("without").map((r) => r.score)) : null;
-        const failing = arm("with").flatMap((r) => r.error ? [{ name: "run error", weight: Infinity, explanation: r.error }] : r.graders.filter((g) => !g.passed))
-            .sort((a, b) => b.weight - a.weight)[0];
-        rows.push({
-            case: evalCase.id,
-            with: withScore,
-            without: withoutScore,
-            delta: withScore !== null && withoutScore !== null ? withScore - withoutScore : null,
-            passed: withScore !== null && withScore >= threshold,
-            costUsd: runs.reduce((s, r) => s + r.costUsd, 0),
-            notes: failing === undefined ? "" : `${failing.name}: ${String(failing.explanation).split("\n")[0]}`,
-            runs,
+        const score = mean(runs.with.map((r) => r.score));
+        const scoreWithout = twoArm ? mean(runs.without.map((r) => r.score)) : null;
+        const passRate = (rs) => rs === undefined || rs.length === 0 ? null : rs.filter((r) => r.passed).length / rs.length;
+        results.push({
+            name: evalCase.id,
+            dir: path.relative(pluginDir, evalCase.dir),
+            source: "prose",
+            promptMarkdown: evalCase.prompt,
+            runsPerCase,
+            timeoutSeconds: evalCase.timeout_seconds ?? 300,
+            maxTurns: evalCase.max_turns ?? 10,
+            graders: evalCase.graders.map(graderDefinition),
+            arms: runs,
+            aggregates: {
+                score,
+                passRate: passRate(runs.with),
+                scoreWithout,
+                passRateWithout: passRate(runs.without),
+                delta: score !== null && scoreWithout !== null ? score - scoreWithout : null,
+            },
+            tags: evalCase.tags,
         });
         if (partial !== null) break;
     }
     if (ctx.keepTemp) process.stdout.write(`Workspaces kept: ${ctx.workspacesDir}\n`);
     else await rm(ctx.workspacesDir, { recursive: true, force: true });
 
+    const allRuns = (c) => Object.values(c.arms).flat();
+    const notes = (c) =>
+    {
+        const failing = c.arms.with.flatMap((r) => r.error ? [{ name: "run error", weight: Infinity, explanation: r.error }] : r.graders.filter((g) => !g.passed))
+            .sort((a, b) => b.weight - a.weight)[0];
+        return failing === undefined ? "" : `${failing.name}: ${String(failing.explanation).split("\n")[0]}`;
+    };
     const header = twoArm ? ["CASE", "WITH", "W/OUT", "Δ", "RUNS", "COST", "NOTES"] : ["CASE", "SCORE", "RUNS", "COST", "NOTES"];
-    const body = rows.map((r) => twoArm
-        ? [r.case, fmt(r.with), fmt(r.without), fmt(r.delta, true), r.runs.length, `$${r.costUsd.toFixed(2)}`, r.notes]
-        : [r.case, fmt(r.with), r.runs.length, `$${r.costUsd.toFixed(2)}`, r.notes]);
+    const body = results.map((c) => [c.name, fmt(c.aggregates.score), ...(twoArm ? [fmt(c.aggregates.scoreWithout), fmt(c.aggregates.delta, true)] : []),
+        allRuns(c).length, `$${allRuns(c).reduce((s, r) => s + runCost(r), 0).toFixed(2)}`, notes(c)]);
     const widths = header.map((h, i) => Math.max(...[h, ...body.map((b) => b[i])].map((v) => String(v).length)));
     for (const line of [header, ...body]) process.stdout.write(`${line.map((v, i) => String(v).padEnd(widths[i])).join("  ").trimEnd()}\n`);
-    const deltas = rows.map((r) => r.delta).filter((d) => d !== null);
-    process.stdout.write(`${rows.length} case(s)${twoArm ? ` · mean Δ ${fmt(mean(deltas), true)}` : ""} · $${spent.toFixed(2)} (agent runs only)\n`);
+    const deltas = results.map((c) => c.aggregates.delta).filter((d) => d !== null);
+    process.stdout.write(`${results.length} case(s)${twoArm ? ` · mean Δ ${fmt(mean(deltas), true)}` : ""} · $${spent.toFixed(2)}\n`);
 
-    const aggregate = { partial: partial !== null, partialReason: partial, threshold, ablation, cases: rows };
+    // Claude's aggregate-result.json schema; `agent`, `piVersion`, `judgeCostUsd`, `partialReason`, `tags`,
+    // `eventsPath`, `judgeOutputs` and grader `arm` are Pi-only additions.
+    const flat = results.flatMap(allRuns);
+    const aggregate = {
+        schemaVersion: 1,
+        agent: "pi",
+        piVersion: await new Promise((resolve) => execFile("pi", ["--version"], (_, out) => resolve(String(out).trim()))),
+        startedAt: startedAt.toISOString(),
+        durationSeconds: Math.round((Date.now() - startedAt) / 1000),
+        costUsd: flat.reduce((s, r) => s + r.costUsd, 0),
+        judgeCostUsd: flat.reduce((s, r) => s + r.judgeCostUsd, 0),
+        partial: partial !== null,
+        partialReason: partial,
+        suite: {
+            root: pluginDir,
+            ablation,
+            modelOverride: ctx.model ?? null,
+            judgeModel: ctx.judgeModel ?? null,
+            threshold,
+            concurrency: 1,
+            plugins: [{ name: pluginName, path: pluginDir }],
+        },
+        cases: results,
+        aggregates: {
+            casesTotal: results.length,
+            casesPassed: results.filter((c) => c.aggregates.score !== null && c.aggregates.score >= threshold).length,
+            overallScore: mean(results.map((c) => c.aggregates.score).filter((x) => x !== null)),
+            overallPassRate: mean(results.map((c) => c.aggregates.passRate).filter((x) => x !== null)),
+            meanDelta: mean(deltas),
+        },
+    };
     await mkdir(ctx.outputDir, { recursive: true });
     await writeFile(path.join(ctx.outputDir, "aggregate-result.json"), `${JSON.stringify(aggregate, null, 2)}\n`);
-    await writeFile(path.join(ctx.outputDir, "report.html"), renderHtml(aggregate));
+    await writeFile(path.join(ctx.outputDir, "report.html"), renderHtml(aggregate, target));
     process.stdout.write(`Report: ${path.join(ctx.outputDir, "report.html")}\n`);
     if (partial !== null) { process.stderr.write(`Partial run: ${partial}\n`); process.exitCode = 2; }
-    else if (rows.some((r) => !r.passed)) process.exitCode = 1;
+    else if (aggregate.aggregates.casesPassed < results.length) process.exitCode = 1;
 }
 
 main().catch((error) =>

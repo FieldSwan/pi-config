@@ -45,20 +45,35 @@ function matcher(spec)
 
 function judgeVote(model, prompt)
 {
-    const args = ["-p", "--no-session", "--no-tools", "--no-skills", "--no-extensions", "--no-context-files", "--no-prompt-templates"];
+    const args = ["--mode", "json", "-p", "--no-session", "--no-tools", "--no-skills", "--no-extensions", "--no-context-files", "--no-prompt-templates"];
     if (model !== undefined) args.push("--model", model);
     // `pi -p` reads piped stdin, so it must be closed or the judge waits forever.
-    return new Promise((resolve, reject) => execFile("pi", [...args, prompt], { maxBuffer: 1 << 24, timeout: 300_000, cwd: os.tmpdir() },
-        (error, stdout) => error ? reject(error) : resolve(stdout.trim())).stdin.end());
+    return new Promise((resolve, reject) => execFile("pi", [...args, prompt], { maxBuffer: 1 << 26, timeout: 300_000, cwd: os.tmpdir() }, (error, stdout) =>
+    {
+        if (error) return reject(error);
+        const end = stdout.split("\n").filter(Boolean).map((l) => JSON.parse(l)).findLast((e) => e.type === "agent_end");
+        if (end === undefined) return reject(new Error("judge did not finish"));
+        const replies = end.messages.filter((m) => m.role === "assistant");
+        resolve({
+            text: (replies.at(-1)?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n").trim(),
+            cost: replies.reduce((s, m) => s + (m.usage?.cost?.total ?? 0), 0),
+        });
+    }).stdin.end());
 }
 
 // Passes on at least two of three votes, like Claude's judge.
 async function judge(model, prompt, excerpt)
 {
     const votes = await Promise.all([0, 1, 2].map(() => judgeVote(model, prompt)));
-    const isPass = (v) => /^\W*PASS/iu.test(v);
-    const passed = votes.filter(isPass).length >= 2;
-    return { passed, explanation: votes.find((v) => isPass(v) === passed) ?? votes[0], votes, excerpt };
+    const judgeVotes = votes.map((v) => /^\W*PASS/iu.test(v.text));
+    return {
+        passed: judgeVotes.filter(Boolean).length >= 2,
+        explanation: `judge votes: ${judgeVotes.map((v) => v ? "PASS" : "FAIL").join(" ")}`,
+        judgeVotes,
+        evidence: excerpt,
+        judgeOutputs: votes.map((v) => v.text),
+        judgeCostUsd: votes.reduce((s, v) => s + v.cost, 0),
+    };
 }
 
 const VERDICT = "Answer PASS or FAIL on the first line, then one sentence explaining why.";
@@ -73,13 +88,17 @@ export async function grade(grader, run, judgeModel)
             const count = [...text.matchAll(new RegExp(grader.pattern, `${(grader.flags ?? "").replace("g", "")}g`))].length;
             const mode = grader.match ?? "contains";
             const passed = mode === "not_contains" ? count === 0 : mode.startsWith("count:") ? count === Number(mode.slice(6)) : count > 0;
-            return { passed, explanation: `${count} match(es) for /${grader.pattern}/ (${mode})` };
+            const where = typeof grader.target === "object" ? grader.target.path : grader.target ?? "last_message";
+            const explanation = mode === "not_contains" ? (passed ? `pattern absent from ${where}` : `pattern found ${count}x in ${where}`)
+                : mode.startsWith("count:") ? `pattern matched ${count}x in ${where} (expected ${mode.slice(6)})`
+                : passed ? `matched ${grader.pattern}` : `pattern not found in ${where}`;
+            return { passed, explanation };
         }
         case "tool_used": {
             const count = toolCalls(run.transcript).filter(matcher(grader)).length;
             const min = grader.min ?? 1;
             const max = grader.max ?? Infinity;
-            return { passed: count >= min && count <= max, explanation: `${grader.tool} called ${count} time(s), wanted ${min}..${max}` };
+            return { passed: count >= min && count <= max, explanation: `${grader.tool} called ${count}x (expected ${min}..${max === Infinity ? "∞" : max})` };
         }
         case "tool_order": {
             const calls = toolCalls(run.transcript);
