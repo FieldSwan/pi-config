@@ -1,0 +1,9 @@
+{
+  "name": "pi-plugin-eval",
+  "private": true,
+  "type": "module",
+  "description": "Runs `claude plugin eval` suites through Pi",
+  "bin": { "pi-plugin-eval": "run.mjs" },
+  "engines": { "node": ">=22.19" },
+  "dependencies": { "yaml": "2.9.1" }
+}
